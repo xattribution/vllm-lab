@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""GB10-like nvidia-smi: unified memory, so memory fields read [N/A]."""
+import json
+import os
+import random
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import fakelib as F  # noqa: E402
+
+args = " ".join(sys.argv[1:])
+running = 0
+try:
+    st = json.loads(F.STATE.read_text())
+    running = sum(1 for c in st.get("containers", {}).values() if c.get("state") == "running" and c.get("kind") == "engine")
+except Exception:
+    pass
+if "--query-gpu=driver_version" in args:
+    print("580.95.05")
+elif "--query-gpu" in args:
+    util = min(99, running * 18 + random.randint(0, 12))
+    temp = 41 + running * 6 + random.randint(0, 3)
+    power = 18 + running * 22 + random.random() * 6
+    print(f"0, NVIDIA GB10, {util}, {temp}, {power:.2f}, [N/A], [N/A], [N/A], {2400 + random.randint(0, 200)}")
+else:
+    print("""+-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
+|-----------------------------------------+------------------------+----------------------+
+|   0  NVIDIA GB10                    On  |   0000000F:01:00.0 Off |                  N/A |
++-----------------------------------------------------------------------------------------+""")

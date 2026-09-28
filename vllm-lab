@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$HERE/vllm_lab.py" ]]; then
+  exec python3 "$HERE/vllm_lab.py" "$@"
+fi
+if [[ -f "$HOME/bin/vllm_lab.py" ]]; then
+  exec python3 "$HOME/bin/vllm_lab.py" "$@"
+fi
+echo "vllm_lab.py not found next to this wrapper" >&2
+exit 1

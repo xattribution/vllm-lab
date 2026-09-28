@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""A small Docker CLI simulator: enough of `docker` for vllm-lab's real code paths."""
+import json
+import os
+import random
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import fakelib as F  # noqa: E402
+
+HERE = Path(__file__).resolve().parent.parent
+PY = sys.executable
+
+
+def out(s=""):
+    sys.stdout.write(s + ("\n" if s and not s.endswith("\n") else ""))
+
+
+def err(s, code=1):
+    sys.stderr.write(s + "\n")
+    sys.exit(code)
+
+
+def find(st, ref):
+    for c in st["containers"].values():
+        if c["name"] == ref or c["id"].startswith(ref):
+            return c
+    return None
+
+
+def reconcile(st):
+    t = time.time()
+    for c in st["containers"].values():
+        if c["state"] in ("running", "restarting") and not F.alive(c.get("pid")):
+            code = 1
+            ef = Path(c["log"] + ".exit")
+            if ef.exists():
+                try:
+                    code = int(ef.read_text().strip() or 1)
+                except ValueError:
+                    code = 1
+            if c["state"] == "running":
+                c["exit_code"] = code
+                c["finished"] = F.now_iso()
+                c["died_at"] = t
+            pol = c.get("restart", "no")
+            if c.get("user_stopped") or pol == "no" or (pol == "on-failure" and code == 0):
+                c["state"] = "exited"
+                continue
+            if t - c.get("died_at", t) < 1.5:
+                c["state"] = "restarting"
+                continue
+            c["restarts"] = c.get("restarts", 0) + 1
+            launch(st, c)
+
+
+def launch(st, c):
+    image = c["image"]
+    env = dict(os.environ)
+    env.update(c.get("env") or {})
+    ef = Path(c["log"] + ".exit")
+    if ef.exists():
+        ef.unlink()
+    port = c.get("host_port")
+    kind = "idle"
+    if "open-webui" in image:
+        kind = "webui"
+        argv = [PY, str(HERE / "fake_webui.py"), "--port", str(port or 58110)]
+    elif c.get("entrypoint") == "python3":
+        kind = "script"
+        argv = [PY, str(HERE / "fake_download.py")] + c["cmd"]
+        env["FAKE_CACHE_MOUNT"] = c.get("cache_mount") or ""
+    elif "vllm" in image or "llama" in image:
+        kind = "engine"
+        util = 0.5
+        cmd = c["cmd"]
+        for i, a in enumerate(cmd):
+            if a == "--gpu-memory-utilization" and i + 1 < len(cmd):
+                util = float(cmd[i + 1])
+        if "llama" in image and "vllm" not in image:
+            util = 0.2
+        need_kb = int(util * F.TOTAL_KB)
+        free_kb = F.free_kb(st, exclude=c["name"])
+        c["reserve_kb"] = need_kb
+        env["FAKE_NEED_KB"] = str(need_kb)
+        env["FAKE_FREE_KB"] = str(free_kb)
+        env["FAKE_TOTAL_KB"] = str(F.TOTAL_KB)
+        env["FAKE_IMAGE"] = image
+        env["FAKE_CACHE_MOUNT"] = c.get("cache_mount") or ""
+        argv = [PY, str(HERE / "fake_vllm.py"), "--listen", str(port or 0)] + c["cmd"]
+    else:
+        argv = [PY, "-c", "import time\nwhile True: time.sleep(60)"]
+    logf = open(c["log"], "ab")
+    wrapper = [PY, str(HERE / "exitwrap.py"), c["log"] + ".exit"] + argv
+    p = subprocess.Popen(wrapper, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env, start_new_session=True)
+    c["pid"] = p.pid
+    c["state"] = "running"
+    c["started"] = F.now_iso()
+    c["user_stopped"] = False
+    c["kind"] = kind
+
+
+def kill(c, timeout=5):
+    pid = c.get("pid")
+    if pid and F.alive(pid):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        t0 = time.time()
+        while F.alive(pid) and time.time() - t0 < timeout:
+            time.sleep(0.05)
+        if F.alive(pid):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            time.sleep(0.1)
+
+
+def ps_row(c):
+    ports = ""
+    if c.get("host_port"):
+        ports = f"{c.get('host_ip', '0.0.0.0')}:{c['host_port']}->{c.get('cport', 8000)}/tcp"
+    status = {"running": "Up 3 minutes", "exited": f"Exited ({c.get('exit_code', 0)}) 1 minute ago",
+              "restarting": f"Restarting ({c.get('exit_code', 1)}) 1 second ago", "created": "Created"}.get(c["state"], c["state"])
+    return {"ID": c["id"][:12], "Names": c["name"], "Image": c["image"], "State": c["state"], "Status": status, "Ports": ports,
+            "Labels": ",".join(f"{k}={v}" for k, v in (c.get("labels") or {}).items()), "CreatedAt": c.get("created_h", ""),
+            "RunningFor": "3 minutes ago", "Command": '"' + " ".join(c.get("cmd", []))[:40] + '"'}
+
+
+def inspect_obj(c):
+    running = c["state"] == "running"
+    ports = {}
+    if c.get("host_port"):
+        ports[f"{c.get('cport', 8000)}/tcp"] = [{"HostIp": c.get("host_ip", "0.0.0.0"), "HostPort": str(c["host_port"])}]
+    return {
+        "Id": c["id"], "Name": "/" + c["name"], "Image": "sha256:" + c["id"][:12], "RestartCount": c.get("restarts", 0),
+        "State": {"Status": c["state"], "Running": running, "Paused": False, "Restarting": c["state"] == "restarting",
+                  "OOMKilled": bool(c.get("oom")), "Dead": False, "Pid": c.get("pid") if running else 0,
+                  "ExitCode": c.get("exit_code", 0) if not running else 0, "Error": "",
+                  "StartedAt": c.get("started", "0001-01-01T00:00:00Z"), "FinishedAt": c.get("finished", "0001-01-01T00:00:00Z")},
+        "Config": {"Image": c["image"], "Cmd": c.get("cmd", []), "Labels": c.get("labels", {}), "Env": [f"{k}={v}" for k, v in (c.get("env") or {}).items()]},
+        "HostConfig": {"RestartPolicy": {"Name": c.get("restart", "no")}, "NetworkMode": (c.get("networks") or ["bridge"])[0]},
+        "NetworkSettings": {"Ports": ports, "Networks": {n: {"IPAddress": "172.18.0.%d" % (hash(c["name"]) % 200 + 2)} for n in c.get("networks") or ["bridge"]}},
+        "Mounts": [{"Source": m.split(":")[0], "Destination": m.split(":")[1]} for m in c.get("mounts", [])],
+    }
+
+
+def parse_run(args):
+    c = {"labels": {}, "env": {}, "mounts": [], "networks": [], "restart": "no", "detach": False}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if not a.startswith("-"):
+            break
+        def val():
+            nonlocal i
+            if "=" in a and a.startswith("--"):
+                return a.split("=", 1)[1]
+            i += 1
+            return args[i]
+        key = a.split("=", 1)[0]
+        if key in ("-d", "--detach"):
+            c["detach"] = True
+        elif key == "--rm":
+            c["rm"] = True
+        elif key == "--name":
+            c["name"] = val()
+        elif key in ("-l", "--label"):
+            k, _, v = val().partition("=")
+            c["labels"][k] = v
+        elif key == "--restart":
+            c["restart"] = val().split(":")[0]
+        elif key in ("-e", "--env"):
+            k, eq, v = val().partition("=")
+            c["env"][k] = v if eq else os.environ.get(k, "")
+        elif key == "--env-file":
+            p = val()
+            try:
+                for ln in Path(p).read_text().splitlines():
+                    if "=" in ln and not ln.startswith("#"):
+                        k, v = ln.split("=", 1)
+                        c["env"][k] = v
+            except OSError:
+                err(f"docker: open {p}: no such file or directory.", 125)
+        elif key in ("-v", "--volume"):
+            c["mounts"].append(val())
+        elif key == "--network":
+            c["networks"].append(val())
+        elif key in ("-p", "--publish"):
+            parts = val().split(":")
+            if len(parts) == 3:
+                c["host_ip"], c["host_port"], c["cport"] = parts[0], int(parts[1]), int(parts[2].split("/")[0])
+            else:
+                c["host_port"], c["cport"] = int(parts[0]), int(parts[1])
+        elif key == "--entrypoint":
+            c["entrypoint"] = val()
+        elif key in ("--gpus", "--shm-size", "--ipc", "--add-host", "-w", "--user", "-u"):
+            if "=" not in a:
+                i += 1
+        i += 1
+    c["image"] = args[i] if i < len(args) else ""
+    c["cmd"] = args[i + 1:]
+    return c
+
+
+def main(argv):
+    if not argv:
+        err("usage: docker COMMAND")
+    if os.environ.get("FAKE_DOCKER_DOWN"):
+        err("failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running", 1)
+    cmd, args = argv[0], argv[1:]
+    if cmd == "version":
+        out("27.3.1")
+        return
+    if cmd == "info":
+        if "--format" in args:
+            out('{"io.containerd.runc.v2":{"path":"runc"},"nvidia":{"path":"nvidia-container-runtime"},"runc":{"path":"runc"}}')
+        else:
+            out("Server Version: 27.3.1\nRuntimes: io.containerd.runc.v2 nvidia runc")
+        return
+    if cmd == "logs":
+        follow = "-f" in args or "--follow" in args
+        ts = "--timestamps" in args or "-t" in args
+        tail = None
+        if "--tail" in args:
+            tail = int(args[args.index("--tail") + 1])
+        name = args[-1]
+        with F.locked() as st:
+            reconcile(st)
+            c = find(st, name)
+            if not c:
+                err(f"Error response from daemon: No such container: {name}")
+            log = c["log"]
+        data = Path(log).read_bytes() if Path(log).exists() else b""
+        lines = re.split(rb"(?<=\n)", data)
+        if tail is not None:
+            lines = lines[-tail:] if tail else []
+        for ln in lines:
+            s = ln.decode("utf-8", "replace")
+            if ts and s.strip():
+                s = F.now_iso() + " " + s
+            sys.stdout.write(s)
+        sys.stdout.flush()
+        if follow:
+            pos = len(data)
+            try:
+                while True:
+                    time.sleep(0.3)
+                    d2 = Path(log).read_bytes() if Path(log).exists() else b""
+                    if len(d2) > pos:
+                        chunk = d2[pos:].decode("utf-8", "replace")
+                        if ts:
+                            chunk = "".join((F.now_iso() + " " + l) if l.strip() else l for l in re.split(r"(?<=\n)", chunk))
+                        sys.stdout.write(chunk)
+                        sys.stdout.flush()
+                        pos = len(d2)
+            except (KeyboardInterrupt, BrokenPipeError):
+                return
+        return
+    with F.locked() as st:
+        reconcile(st)
+        run_cmd(st, cmd, args)
+
+
+def run_cmd(st, cmd, args):
+    if cmd == "ps":
+        short = "".join(a[1:] for a in args if a.startswith("-") and not a.startswith("--"))
+        show_all = "a" in short or "--all" in args
+        quiet = "q" in short or "--quiet" in args
+        filters = [args[i + 1] for i, a in enumerate(args) if a == "--filter"]
+        rows = []
+        for c in st["containers"].values():
+            if not show_all and c["state"] != "running":
+                continue
+            ok = True
+            for f in filters:
+                k, _, v = f.partition("=")
+                if k == "label":
+                    lk, eq, lv = v.partition("=")
+                    if lk not in c["labels"] or (eq and c["labels"][lk] != lv):
+                        ok = False
+                elif k == "name":
+                    if not re.search(v, c["name"]):
+                        ok = False
+            if ok:
+                rows.append(c)
+        for c in rows:
+            if quiet:
+                out(c["id"][:12])
+            elif "--format" in args:
+                fmt = args[args.index("--format") + 1]
+                if fmt == "{{json .}}":
+                    out(json.dumps(ps_row(c)))
+                elif fmt == "{{.Names}}":
+                    out(c["name"])
+                else:
+                    out(json.dumps(ps_row(c)))
+            else:
+                r = ps_row(c)
+                out(f"{r['ID']}  {r['Image']}  {r['Status']}  {r['Ports']}  {r['Names']}")
+        return
+    if cmd == "inspect":
+        fmt = None
+        if "-f" in args or "--format" in args:
+            i = args.index("-f") if "-f" in args else args.index("--format")
+            fmt = args[i + 1]
+            args = args[:i] + args[i + 2:]
+        objs = []
+        for ref in args:
+            c = find(st, ref)
+            if not c:
+                sys.stdout.write("[]\n")
+                err(f"Error: No such object: {ref}")
+            objs.append(inspect_obj(c))
+        if fmt:
+            for o in objs:
+                s = fmt
+                s = s.replace("{{.State.Status}}", o["State"]["Status"]).replace("{{.State.ExitCode}}", str(o["State"]["ExitCode"]))
+                s = s.replace("{{.Id}}", o["Id"])
+                out(s)
+        else:
+            out(json.dumps(objs, indent=2))
+        return
+    if cmd == "stats":
+        for c in st["containers"].values():
+            if c["state"] != "running":
+                continue
+            gib = (c.get("reserve_kb") or 300_000) / 1024 / 1024 * 0.08 + random.random() * 0.2
+            out(json.dumps({"Name": c["name"], "CPUPerc": f"{random.uniform(1, 40):.2f}%", "MemUsage": f"{gib:.2f}GiB / 118.3GiB",
+                            "MemPerc": f"{gib/118.3*100:.2f}%", "NetIO": "1.2MB / 3.4MB", "BlockIO": "0B / 0B", "PIDs": "42"}))
+        time.sleep(0.3)
+        return
+    if cmd == "run":
+        spec = parse_run(args)
+        if not spec.get("name"):
+            spec["name"] = "c-" + os.urandom(3).hex()
+        if find(st, spec["name"]):
+            err(f'docker: Error response from daemon: Conflict. The container name "/{spec["name"]}" is already in use by container "{find(st, spec["name"])["id"]}".', 125)
+        img = spec["image"]
+        if img not in st["images"]:
+            if "doesnotexist" in img:
+                err(f"Unable to find image '{img}' locally\ndocker: Error response from daemon: pull access denied for {img.split(':')[0]}, repository does not exist or may require 'docker login'.", 125)
+            st["images"][img] = {"id": "sha256:" + os.urandom(6).hex(), "size": "9.9GB"}
+        if spec.get("host_port"):
+            for o in st["containers"].values():
+                if o.get("host_port") == spec["host_port"] and o["state"] == "running":
+                    err(f"docker: Error response from daemon: driver failed programming external connectivity on endpoint {spec['name']}: Bind for {spec.get('host_ip','0.0.0.0')}:{spec['host_port']} failed: port is already allocated.", 125)
+        for n in spec["networks"]:
+            if n not in st["networks"]:
+                err(f"docker: Error response from daemon: network {n} not found.", 125)
+        cid = os.urandom(32).hex()
+        mounts = spec["mounts"]
+        cache_mount = ""
+        for m in mounts:
+            src, _, dst = m.partition(":")
+            if dst.startswith("/root/.cache/huggingface") or dst.startswith("/root/.cache/llama.cpp"):
+                cache_mount = src
+        c = {"id": cid, "name": spec["name"], "image": img, "cmd": spec["cmd"], "labels": spec["labels"], "env": spec["env"],
+             "mounts": mounts, "networks": spec["networks"] or ["bridge"], "restart": spec["restart"], "host_port": spec.get("host_port"),
+             "host_ip": spec.get("host_ip", "0.0.0.0"), "cport": spec.get("cport", 8000), "entrypoint": spec.get("entrypoint"),
+             "log": str(F.LOGS / f"{spec['name']}-{cid[:8]}.log"), "restarts": 0, "cache_mount": cache_mount, "state": "created",
+             "created_h": time.strftime("%Y-%m-%d %H:%M:%S +0000 UTC", time.gmtime())}
+        st["containers"][cid] = c
+        launch(st, c)
+        out(cid)
+        return
+    if cmd in ("start", "stop", "restart", "rm", "pause", "unpause", "update", "kill"):
+        opts = [a for a in args if a.startswith("-")]
+        refs = [a for i, a in enumerate(args) if not a.startswith("-") and not (i > 0 and args[i - 1] in ("-t", "--time"))]
+        if cmd == "update":
+            pol = next((a.split("=", 1)[1] for a in args if a.startswith("--restart=")), None)
+            for r in refs:
+                c = find(st, r)
+                if not c:
+                    err(f"Error response from daemon: No such container: {r}")
+                if pol:
+                    c["restart"] = pol.split(":")[0]
+                out(r)
+            return
+        for r in refs:
+            c = find(st, r)
+            if not c:
+                if cmd == "rm" and "-f" in opts:
+                    continue
+                err(f"Error response from daemon: No such container: {r}")
+            if cmd == "stop" or cmd == "kill":
+                c["user_stopped"] = True
+                kill(c)
+                c["state"] = "exited"
+                c["exit_code"] = 0 if cmd == "stop" else 137
+                c["finished"] = F.now_iso()
+            elif cmd == "start":
+                if c["state"] != "running":
+                    launch(st, c)
+            elif cmd == "restart":
+                kill(c)
+                launch(st, c)
+            elif cmd == "rm":
+                if c["state"] == "running" and "-f" not in opts:
+                    err(f"Error response from daemon: cannot remove container \"/{c['name']}\": container is running: stop the container before removing or force remove")
+                kill(c)
+                del st["containers"][c["id"]]
+            out(r)
+        return
+    if cmd == "network":
+        sub, rest = args[0], args[1:]
+        if sub == "ls":
+            for n, v in st["networks"].items():
+                out(json.dumps({"Name": n, "Driver": v.get("driver", "bridge"), "Scope": "local", "ID": n[:12]}))
+            return
+        if sub == "inspect":
+            fmt = None
+            if "-f" in rest:
+                i = rest.index("-f")
+                fmt = rest[i + 1]
+                rest = rest[:i] + rest[i + 2:]
+            n = rest[0]
+            if n not in st["networks"]:
+                err(f"Error response from daemon: network {n} not found")
+            if fmt:
+                out(st["networks"][n].get("gateway", "") + " ")
+            else:
+                out(json.dumps([{"Name": n, "IPAM": {"Config": [{"Gateway": st["networks"][n].get("gateway", "")}]}}]))
+            return
+        if sub == "create":
+            n = rest[-1]
+            if n in st["networks"]:
+                err(f"Error response from daemon: network with name {n} already exists")
+            st["networks"][n] = {"driver": "bridge", "gateway": f"172.{18 + len(st['networks'])}.0.1"}
+            out(os.urandom(32).hex())
+            return
+        if sub == "connect":
+            net, name = rest[-2], rest[-1]
+            c = find(st, name)
+            if not c:
+                err(f"Error response from daemon: No such container: {name}")
+            if net in c["networks"]:
+                err(f"Error response from daemon: endpoint with name {name} already exists in network {net}")
+            c["networks"].append(net)
+            return
+        err("unsupported network command")
+    if cmd == "images":
+        for ref, v in st["images"].items():
+            repo, _, tag = ref.rpartition(":")
+            out(json.dumps({"Repository": repo, "Tag": tag, "ID": v["id"][7:19], "Size": v["size"], "CreatedSince": "2 weeks ago"}))
+        return
+    if cmd == "image":
+        sub, rest = args[0], args[1:]
+        if sub == "inspect":
+            ref = rest[-1]
+            if ref not in st["images"]:
+                sys.stdout.write("[]\n")
+                err(f"Error response from daemon: No such image: {ref}")
+            out(st["images"][ref]["id"])
+            return
+        if sub == "prune":
+            out("Total reclaimed space: 0B")
+            return
+    if cmd == "rmi":
+        ref = args[-1]
+        if ref not in st["images"]:
+            err(f"Error response from daemon: No such image: {ref}")
+        for c in st["containers"].values():
+            if c["image"] == ref:
+                err(f"Error response from daemon: conflict: unable to remove repository reference \"{ref}\" (must force) - container {c['id'][:12]} is using its referenced image")
+        del st["images"][ref]
+        out(f"Untagged: {ref}")
+        return
+    if cmd == "pull":
+        ref = args[-1]
+        if "doesnotexist" in ref:
+            err(f"Error response from daemon: pull access denied for {ref}, repository does not exist or may require 'docker login'")
+        if "amd64only" in ref:
+            err(f"no matching manifest for linux/arm64 in the manifest list entries")
+        layers = [os.urandom(6).hex() for _ in range(5)]
+        out(f"{ref.split(':')[-1]}: Pulling from {ref.split(':')[0]}")
+        for l in layers:
+            out(f"{l}: Pulling fs layer")
+        sys.stdout.flush()
+        for l in layers:
+            time.sleep(0.3)
+            out(f"{l}: Downloading")
+            out(f"{l}: Pull complete")
+            sys.stdout.flush()
+        out(f"Status: Downloaded newer image for {ref}")
+        st["images"][ref] = {"id": "sha256:" + os.urandom(6).hex(), "size": "17.9GB"}
+        return
+    if cmd == "build":
+        tag = args[args.index("-t") + 1]
+        df = sys.stdin.read()
+        for i, ln in enumerate([l for l in df.splitlines() if l.strip()], 1):
+            out(f"#{i} [{i}/2] {ln}")
+            sys.stdout.flush()
+            time.sleep(0.2)
+        out(f"#3 naming to docker.io/{tag} done")
+        st["images"][tag] = {"id": "sha256:" + os.urandom(6).hex(), "size": "18.4GB"}
+        return
+    if cmd == "exec":
+        rest = [a for a in args if a not in ("-i", "-t", "-it")]
+        name, prog = rest[0], rest[1:]
+        c = find(st, name)
+        if not c or c["state"] != "running":
+            err(f"Error response from daemon: container {name} is not running")
+        # container DNS: titan-foo:8000 → the host port that container publishes
+        mapped = []
+        for a in prog:
+            m = re.search(r"http://([a-z0-9_.-]+):(\d+)", a)
+            if m:
+                tgt = find(st, m.group(1))
+                if tgt and tgt["state"] == "running" and tgt.get("host_port") and tgt["networks"] and set(tgt["networks"]) & set(c["networks"]):
+                    a = a.replace(m.group(0), f"http://127.0.0.1:{tgt['host_port']}")
+                elif tgt is None and m.group(1) not in ("127.0.0.1", "localhost") and not re.match(r"^\d", m.group(1)):
+                    a = a.replace(m.group(0), "http://unresolvable.invalid:1")
+            mapped.append(a)
+        if mapped and mapped[0] in ("python", "python3"):
+            mapped[0] = PY
+        r = subprocess.run(mapped, capture_output=True, text=True, timeout=30)
+        sys.stdout.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        sys.exit(r.returncode)
+    if cmd == "port":
+        c = find(st, args[0])
+        if c and c.get("host_port"):
+            out(f"{c.get('host_ip', '0.0.0.0')}:{c['host_port']}")
+        return
+    err(f"docker: '{cmd}' is not a docker command (simulator)")
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except BrokenPipeError:
+        pass
